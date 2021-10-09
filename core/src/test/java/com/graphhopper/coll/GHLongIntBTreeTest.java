@@ -32,8 +32,8 @@ public class GHLongIntBTreeTest {
     @Test
     public void testThrowException_IfPutting_NoNumber() {
         GHLongIntBTree instance = new GHLongIntBTree(2);
-        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> instance.put(-1, 1));
-        assertTrue(ex.getMessage().contains("Illegal key -1"));
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> instance.put(Integer.MIN_VALUE, 1));
+        assertTrue(ex.getMessage().contains("Illegal key -2147483648"));
     }
 
     @Test
@@ -42,7 +42,7 @@ public class GHLongIntBTreeTest {
         long key = 9485854858458484L;
         instance.put(key, 21);
         assertEquals(21, instance.get(key));
-        assertEquals(-1, instance.get(404));
+        assertEquals(Integer.MIN_VALUE, instance.get(404));
     }
 
     @Test
@@ -146,7 +146,7 @@ public class GHLongIntBTreeTest {
             Random rand = new Random(seed);
             Set<Integer> addedValues = new LinkedHashSet<>(size);
             for (int i = 0; i < size; i++) {
-                int val = rand.nextInt(size);
+                int val = rand.nextInt(size) - Integer.MIN_VALUE / 2;
                 addedValues.add(val);
                 try {
                     instance.put(val, val);

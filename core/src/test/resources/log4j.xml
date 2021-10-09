@@ -11,7 +11,7 @@
         <appender-ref ref="stdout"/>
     </appender>
     <logger name="com.graphhopper" additivity="false">
-        <level value="warn"/>
+        <level value="info"/>
         <appender-ref ref="ASYNC"/>
     </logger>
     <root>

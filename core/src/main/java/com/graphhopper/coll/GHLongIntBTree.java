@@ -31,7 +31,7 @@ import java.util.Arrays;
  * @author Peter Karich
  */
 public class GHLongIntBTree implements LongIntMap {
-    private final int noNumberValue = -1;
+    private final int noNumberValue = Integer.MIN_VALUE;
     private Logger logger = LoggerFactory.getLogger(getClass());
     private long size;
     private int maxLeafEntries;

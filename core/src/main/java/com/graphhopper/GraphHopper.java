@@ -23,7 +23,7 @@ import com.graphhopper.config.CHProfile;
 import com.graphhopper.config.LMProfile;
 import com.graphhopper.config.Profile;
 import com.graphhopper.reader.dem.*;
-import com.graphhopper.reader.osm.OSMReader;
+import com.graphhopper.reader.osm.NewNewOSMReader;
 import com.graphhopper.reader.osm.conditional.DateRangeParser;
 import com.graphhopper.routing.*;
 import com.graphhopper.routing.ch.CHPreparationHandler;
@@ -646,20 +646,18 @@ public class GraphHopper {
         AreaIndex<CustomArea> areaIndex = new AreaIndex<>(customAreas);
 
         logger.info("start creating graph from " + osmFile);
-        OSMReader reader = new OSMReader(ghStorage, osmReaderConfig).setFile(_getOSMFile()).
+        ghStorage.create(100);
+        NewNewOSMReader reader = new NewNewOSMReader(ghStorage, osmReaderConfig, ghStorage.getEncodingManager()).
                 setAreaIndex(areaIndex).
                 setElevationProvider(eleProvider).
                 setCountryRuleFactory(countryRuleFactory);
         logger.info("using " + ghStorage.toString() + ", memory:" + getMemInfo());
-        try {
-            reader.readGraph();
-        } catch (IOException ex) {
-            throw new RuntimeException("Cannot read file " + getOSMFile(), ex);
-        }
+        reader.readOSM(_getOSMFile());
         DateFormat f = createFormatter();
         ghStorage.getProperties().put("datareader.import.date", f.format(new Date()));
-        if (reader.getDataDate() != null)
-            ghStorage.getProperties().put("datareader.data.date", f.format(reader.getDataDate()));
+        // todonow
+//        if (reader.getDataDate() != null)
+//            ghStorage.getProperties().put("datareader.data.date", f.format(reader.getDataDate()));
     }
 
     private List<CustomArea> readCustomAreas() {

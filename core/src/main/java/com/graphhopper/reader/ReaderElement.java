@@ -41,9 +41,13 @@ public abstract class ReaderElement {
     }
 
     protected ReaderElement(long id, int type, int propertyMapSize) {
+        this(id, type, new HashMap<>(propertyMapSize));
+    }
+
+    protected ReaderElement(long id, int type, Map<String, Object> properties) {
         this.id = id;
         this.type = type;
-        properties = new HashMap<>(propertyMapSize);
+        this.properties = properties;
     }
 
     public long getId() {
@@ -64,7 +68,7 @@ public abstract class ReaderElement {
         return tagTxt.toString();
     }
 
-    protected Map<String, Object> getTags() {
+    public Map<String, Object> getTags() {
         return properties;
     }
 
