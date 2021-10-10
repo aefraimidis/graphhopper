@@ -18,16 +18,12 @@
 
 package com.graphhopper.reader.osm;
 
-import com.carrotsearch.hppc.LongArrayList;
-import com.carrotsearch.hppc.LongHashSet;
-import com.carrotsearch.hppc.LongIntScatterMap;
-import com.carrotsearch.hppc.LongSet;
+import com.carrotsearch.hppc.*;
 import com.carrotsearch.hppc.cursors.LongCursor;
+import com.graphhopper.coll.GHIntLongHashMap;
+import com.graphhopper.coll.GHLongHashSet;
 import com.graphhopper.coll.GHLongIntBTree;
-import com.graphhopper.reader.ReaderElement;
-import com.graphhopper.reader.ReaderNode;
-import com.graphhopper.reader.ReaderRelation;
-import com.graphhopper.reader.ReaderWay;
+import com.graphhopper.reader.*;
 import com.graphhopper.reader.dem.EdgeSampling;
 import com.graphhopper.reader.dem.ElevationProvider;
 import com.graphhopper.reader.dem.GraphElevationSmoothing;
@@ -38,6 +34,7 @@ import com.graphhopper.routing.util.CustomArea;
 import com.graphhopper.routing.util.EncodingManager;
 import com.graphhopper.routing.util.countryrules.CountryRule;
 import com.graphhopper.routing.util.countryrules.CountryRuleFactory;
+import com.graphhopper.routing.util.parsers.TurnCostParser;
 import com.graphhopper.storage.*;
 import com.graphhopper.util.*;
 import com.graphhopper.util.shapes.GHPoint;
@@ -48,9 +45,11 @@ import javax.xml.stream.XMLStreamException;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import static com.graphhopper.reader.osm.OSMReader.createTurnRelations;
 import static com.graphhopper.util.Helper.nf;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.emptyMap;
@@ -69,8 +68,15 @@ public class NewNewOSMReader {
     private CountryRuleFactory countryRuleFactory = null;
     private GHLongIntBTree nodePointersByOSMNodeIds;
     private DataAccess nodeEntries;
+    // todonow: keeping the reader relations here should be ok memory-wise as long as we only keep those related to
+    //          our routes and skip restrictions. we should also clear the member list of each relation. and should we
+    //          use the ReaderRelation type?
+    private final LongObjectMap<List<ReaderRelation>> osmRelationsByWayID = new LongObjectScatterMap<>();
+    private GHLongHashSet osmWayIdSet = new GHLongHashSet();
+    private IntLongMap edgeIdToOsmWayIdMap = new GHIntLongHashMap();
 
     private final GraphHopperStorage graph;
+    private final TurnCostStorage tcs;
 
     public NewNewOSMReader(GraphHopperStorage graph, OSMReaderConfig config, EncodingManager encodingManager) {
         this.graph = graph;
@@ -79,6 +85,7 @@ public class NewNewOSMReader {
         this.nodePointersByOSMNodeIds = new GHLongIntBTree(200);
         this.nodeEntries = new RAMDirectory().create("", DAType.RAM_INT, 1 << 20);
         this.nodeEntries.create(100);
+        tcs = graph.getTurnCostStorage();
     }
 
     public void readOSM(File file) {
@@ -142,8 +149,14 @@ public class NewNewOSMReader {
     private class Pass1Handler implements ReaderElementHandler {
         private boolean handledWays;
         private long wayCounter = -1;
+        private long relationsCounter = -1;
+        private long relevantRelationsCounter = -1;
+        private long metaRelationsCounter = -1;
+        private long restrictionRelationsCounter = -1;
         private long acceptedWays = 0;
         private int nextNodePointer = Integer.MIN_VALUE + 1;
+        private final LongSet wayIds = new LongScatterSet();
+        private final LongSet wayIdsWithRestrictions = new LongScatterSet();
 
         @Override
         public void handleWay(ReaderWay way) {
@@ -175,6 +188,48 @@ public class NewNewOSMReader {
                     }
                 }
             }
+            // we keep track of all the ways we keep so we can later ignore OSM relations that do not include any
+            // ways of interest
+            wayIds.add(way.getId());
+        }
+
+        @Override
+        public void handleRelation(ReaderRelation relation) {
+            if (++relationsCounter % 1_000_000 == 0)
+                LOGGER.info("pass1 - processed relations: " + nf(relationsCounter) + ", " + Helper.getMemInfo());
+            if (relation.isMetaRelation())
+                ++metaRelationsCounter;
+            if (relation.hasTag("type", "restriction")) {
+                ++restrictionRelationsCounter;
+                relation.getMembers().forEach(m -> wayIdsWithRestrictions.add(m.getRef()));
+            }
+            boolean relevant = relation.getMembers().stream().map(ReaderRelation.Member::getRef).anyMatch(wayIds::contains);
+            if (relevant)
+                ++relevantRelationsCounter;
+
+            if (relation.hasTag("type", "restriction")) {
+                // we keep the osm way ids that occur in turn relations, because this way we know for which GH edges
+                // we need to remember the associated osm way id
+                List<OSMTurnRelation> turnRelations = createTurnRelations(relation);
+                for (OSMTurnRelation turnRelation : turnRelations) {
+                    osmWayIdSet.add(turnRelation.getOsmIdFrom());
+                    osmWayIdSet.add(turnRelation.getOsmIdTo());
+                }
+            } else if (!relation.isMetaRelation() && relation.hasTag("type", "route")) {
+                // todonow: should we keep others than 'route'?
+                for (ReaderRelation.Member member : relation.getMembers()) {
+                    // we only support members that reference at least one of the ways we are interested in
+                    if (member.getType() == ReaderRelation.Member.WAY && wayIds.contains(member.getRef())) {
+                        List<ReaderRelation> relations = osmRelationsByWayID.get(member.getRef());
+                        if (relations == null) {
+                            relations = new ArrayList<>();
+                            osmRelationsByWayID.put(member.getRef(), relations);
+                        }
+                        relations.add(relation);
+                    }
+                }
+            }
+
         }
 
         private void setNodeType(int nodePointer, int nodeType) {
@@ -187,7 +242,7 @@ public class NewNewOSMReader {
 
         @Override
         public void onFinish() {
-            LOGGER.info("pass1 - accepted ways: " + nf(acceptedWays) + ", way nodes: " + nf(nodePointersByOSMNodeIds.getSize()));
+            LOGGER.info("pass1 - accepted ways: " + nf(acceptedWays) + ", wayIds: " + wayIds.size() + ", wayIds for restrictions " + wayIdsWithRestrictions.size() + ", way nodes: " + nf(nodePointersByOSMNodeIds.getSize()) + ", relations: " + nf(relationsCounter) + ", relevant relations: " + nf(relevantRelationsCounter) + ", meta relations: " + nf(metaRelationsCounter) + ", restriction relations: " + nf(restrictionRelationsCounter));
         }
     }
 
@@ -295,6 +350,9 @@ public class NewNewOSMReader {
                 return;
 
             setArtificialWayTags(way);
+            List<ReaderRelation> relations = osmRelationsByWayID.get(way.getId());
+            if (relations == null)
+                relations = Collections.emptyList();
 
             List<ReaderNode> segment = new ArrayList<>();
             for (LongCursor node : way.getNodes()) {
@@ -313,7 +371,7 @@ public class NewNewOSMReader {
                     // back into it. we do not want to connect the exit/entry points using a straight line. this usually
                     // should only happen for OSM extracts.
                     if (segment.size() > 1) {
-                        handleSegment(segment, way);
+                        handleSegment(segment, way, relations);
                         segment = new ArrayList<>();
                     }
                 } else if (nodeType == JUNCTION_NODE) {
@@ -325,7 +383,7 @@ public class NewNewOSMReader {
                     }
                     if (!segment.isEmpty()) {
                         segment.add(readerNode);
-                        handleSegment(segment, way);
+                        handleSegment(segment, way, relations);
                         segment = new ArrayList<>();
                     }
                     segment.add(readerNode);
@@ -335,10 +393,38 @@ public class NewNewOSMReader {
             }
             // the last segment might end at the end of the way
             if (segment.size() > 1)
-                handleSegment(segment, way);
+                handleSegment(segment, way, relations);
         }
 
-        private void handleSegment(List<ReaderNode> segment, ReaderWay way) {
+        @Override
+        public void handleRelation(ReaderRelation relation) {
+            if (tcs != null && relation.hasTag("type", "restriction")) {
+                TurnCostParser.ExternalInternalMap map = new TurnCostParser.ExternalInternalMap() {
+                    @Override
+                    public int getInternalNodeIdOfOsmNode(long nodeOsmId) {
+                        if (nodeOsmId < 0) {
+                            return extraNodeTowerNodes.get(nodeOsmId);
+                        } else
+                            return getGHId(nodePointersByOSMNodeIds.get(nodeOsmId));
+                    }
+
+                    @Override
+                    public long getOsmIdOfInternalEdge(int edgeId) {
+                        return edgeIdToOsmWayIdMap.get(edgeId);
+                    }
+                };
+                List<OSMTurnRelation> turnRelations = createTurnRelations(relation);
+                for (OSMTurnRelation turnRelation : turnRelations) {
+                    long osmId = turnRelation.getViaOsmNodeId();
+                    int viaNode = map.getInternalNodeIdOfOsmNode(osmId);
+                    if (viaNode >= 0) {
+                        encodingManager.handleTurnRelationTags(turnRelation, map, graph);
+                    }
+                }
+            }
+        }
+
+        private void handleSegment(List<ReaderNode> segment, ReaderWay way, List<ReaderRelation> relations) {
             if (segment.size() < 2)
                 throw new IllegalArgumentException("Segment size must be >= 2");
             boolean isLoop = segment.get(0).getId() == segment.get(segment.size() - 1).getId();
@@ -348,14 +434,14 @@ public class NewNewOSMReader {
                 return;
             }
             if (isLoop) {
-                handleSegmentWithBarriers(segment.subList(0, segment.size() - 1), way);
-                handleSegmentWithBarriers(segment.subList(segment.size() - 2, segment.size()), way);
+                handleSegmentWithBarriers(segment.subList(0, segment.size() - 1), way, relations);
+                handleSegmentWithBarriers(segment.subList(segment.size() - 2, segment.size()), way, relations);
             } else {
-                handleSegmentWithBarriers(segment, way);
+                handleSegmentWithBarriers(segment, way, relations);
             }
         }
 
-        private void handleSegmentWithBarriers(final List<ReaderNode> parentSegment, ReaderWay way) {
+        private void handleSegmentWithBarriers(final List<ReaderNode> parentSegment, ReaderWay way, List<ReaderRelation> relations) {
             List<ReaderNode> segment = new ArrayList<>();
             for (int i = 0; i < parentSegment.size(); i++) {
                 ReaderNode node = parentSegment.get(i);
@@ -372,7 +458,7 @@ public class NewNewOSMReader {
                     if (!segment.isEmpty()) {
                         // the segment up to the barrier
                         segment.add(node);
-                        handleSegmentFinal(segment, way);
+                        handleSegmentFinal(segment, way, relations);
                         segment = new ArrayList<>();
                     }
                     // barrier segment, make sure the extra node is not at the end of the segment
@@ -384,7 +470,7 @@ public class NewNewOSMReader {
                         segment.add(extraNode);
                     }
                     // todonow: make it a 'barrier'
-                    handleSegmentFinal(segment, way);
+                    handleSegmentFinal(segment, way, relations);
                     segment = new ArrayList<>();
                     segment.add(extraNode);
                 } else {
@@ -392,10 +478,10 @@ public class NewNewOSMReader {
                 }
             }
             if (segment.size() > 1)
-                handleSegmentFinal(segment, way);
+                handleSegmentFinal(segment, way, relations);
         }
 
-        private void handleSegmentFinal(List<ReaderNode> segment, ReaderWay way) {
+        private void handleSegmentFinal(List<ReaderNode> segment, ReaderWay way, List<ReaderRelation> relations) {
             // no more loops or missing nodes, already split at barrier nodes and connects two tower nodes
             // -> first and last nodes are tower nodes and the others are geometry
             edgeCount++;
@@ -437,6 +523,10 @@ public class NewNewOSMReader {
                 }
             }
             IntsRef relFlags = encodingManager.createRelationFlags();
+            for (ReaderRelation relation : relations) {
+                relFlags = encodingManager.handleRelationTags(relation, relFlags);
+            }
+
             EncodingManager.AcceptWay acceptWay = new EncodingManager.AcceptWay();
             encodingManager.acceptWay(way, acceptWay);
             IntsRef edgeFlags = encodingManager.handleWayTags(way, acceptWay, relFlags);
@@ -489,6 +579,12 @@ public class NewNewOSMReader {
             }
             encodingManager.applyWayTags(way, edgeState);
             checkDistance(edgeState);
+            storeOsmWayID(edgeState.getEdge(), way.getId());
+        }
+
+        private void storeOsmWayID(int edgeId, long osmWayId) {
+            if (osmWayIdSet.contains(osmWayId))
+                edgeIdToOsmWayIdMap.put(edgeId, osmWayId);
         }
 
         private void checkCoordinates(int nodeIndex, GHPoint point) {
